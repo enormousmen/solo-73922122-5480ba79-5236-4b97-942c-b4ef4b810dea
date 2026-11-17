@@ -22,6 +22,8 @@ services:
       PROXY_PORT: "9000"
       TARGET_HOST: receiver
       TARGET_PORT: "9100"
+      # 排空默认等待秒数；单次 POST /drain/start 可再覆盖
+      PROXY_DRAIN_TIMEOUT: "60"
     ports:
       # 9000: 故障转发 TCP 入口；8080: 控制 API / docs
       - "127.0.0.1:9000:9000"

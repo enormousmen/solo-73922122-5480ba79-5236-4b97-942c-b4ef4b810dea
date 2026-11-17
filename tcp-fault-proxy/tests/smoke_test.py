@@ -18,7 +18,12 @@ Scenarios:
   6. force-close interrupts paused direction and blocked write, tasks exit,
      control API and other connections stay usable;
   7. backpressure: while paused the sender cannot drain the whole sample and
-     proxy per-direction user-space backlog stays <= 256 KiB.
+     proxy per-direction user-space backlog stays <= 256 KiB;
+  8. drain: during a drain new ingress is closed at once, a pre-drain paused
+     connection still finishes after resume, repeated drain start keeps the
+     original deadline, can_stop only after settle, then stop re-opens ingress;
+  9. drain timeout: a still-paused connection is force-closed at the deadline
+     and counted as force_closed with everything settled.
 """
 
 from __future__ import annotations
@@ -117,6 +122,18 @@ def assert_count_stable(count: int, hold: float = 0.8) -> bool:
     """The receipt count must not change while a direction stays paused."""
     time.sleep(hold)
     return receiver_count() == count
+
+
+def _wait_drain_stoppable(timeout: float = 20.0) -> dict:
+    """Poll GET /drain until can_stop is true (truthy dict) or time out."""
+    deadline = time.time() + timeout
+    snap: dict = {}
+    while time.time() < deadline:
+        snap = http_json(PROXY_API, "GET", "/drain")
+        if snap.get("can_stop"):
+            return snap
+        time.sleep(0.05)
+    return {}
 
 
 def raw_upload(size: int, pause_after: int | None):
@@ -352,6 +369,99 @@ def main() -> int:
     run = wait_sender(run["run_id"])
     check("backpressure test finishes clean", run["hash_match"] is True)
     clear_preset()
+
+    # 8. Drain: graceful completion of a pre-drain connection --------------- #
+    set_preset(c2r=400_000)
+    before = receiver_count()
+    run = start_send(size)
+    conn = wait_conn_active()
+    cid = conn["id"]
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        conn = http_json(PROXY_API, "GET", f"/connections/{cid}")
+        if conn["directions"]["c2r"]["paused"]:
+            break
+        time.sleep(0.05)
+    check("drain setup: connection paused", conn["directions"]["c2r"]["paused"] is True)
+    snap = http_json(PROXY_API, "POST", "/drain/start", {"wait_timeout_seconds": 60})
+    check("drain: gate closed", snap["accepting_connections"] is False
+          and snap["state"] == "draining")
+    check("drain: pre-drain connection tracked", snap["tracked_total"] == 1)
+    check("drain: can_stop false while paused", snap["can_stop"] is False)
+    deadline_at = snap["deadline_at"]
+    # New ingress must be closed immediately and must not reach the receiver.
+    probe_reply = b""
+    try:
+        probe = socket.create_connection(PROXY_TCP.split(":"))
+        probe.settimeout(3)
+        try:
+            probe_reply = probe.recv(1)
+        except (ConnectionResetError, socket.timeout):
+            probe_reply = b"<reset-or-timeout>"
+        probe.close()
+    except ConnectionError:
+        probe_reply = b""
+    check("drain: new ingress closed immediately", probe_reply == b"", repr(probe_reply))
+    time.sleep(0.2)
+    check("drain: rejected ingress not forwarded",
+          receiver_count() == before, f"count={receiver_count()} expected={before}")
+    again = http_json(PROXY_API, "POST", "/drain/start", {"wait_timeout_seconds": 3600})
+    check("drain: repeated start keeps deadline", again["deadline_at"] == deadline_at)
+    check("drain: repeated start keeps draining", again["state"] == "draining")
+    http_json(PROXY_API, "POST", f"/connections/{cid}/resume", {"direction": "c2r"})
+    run = wait_sender(run["run_id"])
+    check("drain: old upload+receipt completed",
+          run["phase"] == "done" and run["hash_match"] is True,
+          str(run.get("error") or ""))
+    snap = _wait_drain_stoppable()
+    check("drain: can_stop after old connection settled", bool(snap))
+    check("drain: counts normal=1",
+          snap["counts"] == {"normal": 1, "fault": 0, "force_closed": 0},
+          str(snap["counts"]))
+    check("drain: not timed out", snap["timed_out"] is False)
+    snap = http_json(PROXY_API, "POST", "/drain/stop", {})
+    check("drain: stop reopens ingress", snap["accepting_connections"] is True)
+    clear_preset()
+
+    # 9. Drain timeout force-closes the remaining connection ---------------- #
+    set_preset(c2r=300_000)
+    run = start_send(big_size)
+    conn = wait_conn_active()
+    cid = conn["id"]
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        conn = http_json(PROXY_API, "GET", f"/connections/{cid}")
+        if conn["directions"]["c2r"]["paused"]:
+            break
+        time.sleep(0.05)
+    check("timeout drain setup: connection paused",
+          conn["directions"]["c2r"]["paused"] is True)
+    started = time.monotonic()
+    http_json(PROXY_API, "POST", "/drain/start", {"wait_timeout_seconds": 1.5})
+    snap = _wait_drain_stoppable(timeout=15)
+    elapsed = time.monotonic() - started
+    check("timeout drain: finished", bool(snap), f"{elapsed:.2f}s")
+    check("timeout drain: fired near the deadline", 1.3 <= elapsed <= 6.0,
+          f"{elapsed:.2f}s")
+    check("timeout drain: timed_out flag", snap["timed_out"] is True)
+    check("timeout drain: counts force_closed=1",
+          snap["counts"] == {"normal": 0, "fault": 0, "force_closed": 1},
+          str(snap["counts"]))
+    check("timeout drain: forced connection settled",
+          snap["connections"][0]["settled"]
+          and all(snap["connections"][0]["pumps_done"].values())
+          and snap["connections"][0]["client_socket_closed"]
+          and snap["connections"][0]["remote_socket_closed"])
+    check("timeout drain: connection force reason",
+          snap["connections"][0]["force_reason"] == "drain deadline exceeded")
+    run = wait_sender(run["run_id"])
+    check("timeout drain: sender observed failure", run["phase"] == "failed")
+    http_json(PROXY_API, "POST", "/drain/stop", {})
+    clear_preset()
+    run = start_send(size)
+    run = wait_sender(run["run_id"])
+    check("after drain released, new upload works",
+          run["phase"] == "done" and run["hash_match"] is True)
 
     # Summary -------------------------------------------------------------- #
     failed = [r for r in results if r[0] == FAIL]
